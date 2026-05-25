@@ -43,3 +43,6 @@ app-example
 # generated native folders
 /ios
 /android
+
+DESIGN.md
+current_state.md

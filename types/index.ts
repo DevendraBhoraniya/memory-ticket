@@ -1,3 +1,9 @@
+export interface ExifData {
+  dateTaken?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
 export interface Ticket {
   id: string;
   photoUri: string;
@@ -6,6 +12,8 @@ export interface Ticket {
   note: string;
   location: string;
   date: string;
+  category: string;
+  format: string;
   timestamp: number;
   createdAt: string;
 }

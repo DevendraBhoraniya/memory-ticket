@@ -1,18 +1,31 @@
-import { DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useState, useCallback, createContext, useContext, Suspense } from 'react';
+import { Theme } from '@/theme';
+import { useEffect, useState, createContext, useContext } from 'react';
+import { getOnboardingStatus, setOnboardingCompleted as saveOnboardingStatus, getAllUsedUris, flushExpiredDeletes } from '@/utils/storage';
+import { View, ActivityIndicator, Image, Dimensions } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { ToastProvider } from '@/components/Toast';
+import { ThemeProvider, DarkTheme } from '@react-navigation/native';
 import * as SplashScreen from 'expo-splash-screen';
-import 'react-native-reanimated';
-import { View, StyleSheet, Text, ActivityIndicator } from 'react-native';
-import Animated, { FadeInDown, FadeOutDown } from 'react-native-reanimated';
-import { SQLiteProvider } from 'expo-sqlite';
+import { cleanupOrphanedImages } from '@/utils/image';
 
-import { getOnboardingStatus, setOnboardingCompleted as saveOnboardingStatus } from '@/utils/storage';
-import { Palette, Spacing, Shadows, BorderRadius, Typography } from '@/constants/theme';
-import { initializeDatabase } from '@/utils/database';
+// Keep splash visible while we check onboarding
+SplashScreen.preventAutoHideAsync();
 
-// --- Onboarding Context ---
+const { width } = Dimensions.get('window');
+
+const NavTheme = {
+  ...DarkTheme,
+  colors: {
+    ...DarkTheme.colors,
+    background: Theme.colors.background,
+    card: Theme.colors.card,
+    text: Theme.colors.ink,
+    border: Theme.colors.border,
+  },
+};
+
 interface OnboardingContextType {
   isOnboardingCompleted: boolean | null;
   completeOnboarding: () => Promise<void>;
@@ -25,62 +38,27 @@ const OnboardingContext = createContext<OnboardingContextType>({
 
 export const useOnboarding = () => useContext(OnboardingContext);
 
-// --- Toast Context ---
-interface ToastContextType {
-  showToast: (message: string, type?: 'success' | 'error') => void;
-}
-
-const ToastContext = createContext<ToastContextType>({
-  showToast: () => {},
-});
-
-export const useToast = () => useContext(ToastContext);
-
-// Keep the splash screen visible while we fetch resources
-SplashScreen.preventAutoHideAsync().catch(() => {});
-
-export const unstable_settings = {
-  anchor: 'index',
-};
-
 export default function RootLayout() {
   const router = useRouter();
   const segments = useSegments();
-  
-  const [isReady, setIsReady] = useState(false);
   const [isOnboardingCompleted, setIsOnboardingCompleted] = useState<boolean | null>(null);
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
-
-  const showToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 3000);
-  }, []);
-
-  const completeOnboarding = async () => {
-    try {
-      await saveOnboardingStatus();
-      setIsOnboardingCompleted(true);
-    } catch (e) {
-      throw e;
-    }
-  };
 
   useEffect(() => {
-    async function initializeApp() {
-      try {
-        const completed = await getOnboardingStatus();
-        setIsOnboardingCompleted(completed);
-      } catch (e) {
-        setIsOnboardingCompleted(false);
-      } finally {
-        setIsReady(true);
-      }
+    async function checkStatus() {
+      const status = await getOnboardingStatus();
+      setIsOnboardingCompleted(status);
+      // Clean up expired soft-delete image files
+      await flushExpiredDeletes();
+      // Clean up any orphaned files no longer referenced by any ticket
+      const usedUris = await getAllUsedUris();
+      await cleanupOrphanedImages(usedUris);
+      await SplashScreen.hideAsync();
     }
-    initializeApp();
+    checkStatus();
   }, []);
 
   useEffect(() => {
-    if (!isReady || isOnboardingCompleted === null) return;
+    if (isOnboardingCompleted === null) return;
     const inOnboardingGroup = segments[0] === 'onboarding';
 
     if (!isOnboardingCompleted && !inOnboardingGroup) {
@@ -88,70 +66,52 @@ export default function RootLayout() {
     } else if (isOnboardingCompleted && inOnboardingGroup) {
       router.replace('/');
     }
-  }, [isReady, isOnboardingCompleted, segments]);
+  }, [isOnboardingCompleted, segments]);
 
-  const onLayoutRootView = useCallback(async () => {
-    if (isReady && isOnboardingCompleted !== null) {
-      await SplashScreen.hideAsync();
-    }
-  }, [isReady, isOnboardingCompleted]);
+  const completeOnboarding = async () => {
+    await saveOnboardingStatus();
+    setIsOnboardingCompleted(true);
+  };
 
-  if (!isReady || isOnboardingCompleted === null) {
-    return <View style={{ flex: 1, backgroundColor: Palette.background }} />;
+  if (isOnboardingCompleted === null) {
+    return (
+      <View style={{ flex: 1, backgroundColor: Theme.colors.background, alignItems: 'center', justifyContent: 'center' }}>
+        <Image
+          source={require('../assets/images/splash-icon.png')}
+          style={{ width: 80, height: 80, marginBottom: 24 }}
+          resizeMode="contain"
+        />
+        <ActivityIndicator size="small" color={Theme.colors.accent} />
+      </View>
+    );
   }
-return (
-  <ToastContext.Provider value={{ showToast }}>
-    <OnboardingContext.Provider value={{ isOnboardingCompleted, completeOnboarding }}>
-      <Suspense fallback={
-        <View style={{ flex: 1, backgroundColor: Palette.background, justifyContent: 'center', alignItems: 'center' }}>
-          <ActivityIndicator size="large" color={Palette.primary} />
-        </View>
-      }>
-        <SQLiteProvider databaseName="memory_tickets.db" onInit={initializeDatabase}>
-          <ThemeProvider value={DefaultTheme}>
-            <View style={{ flex: 1 }} onLayout={onLayoutRootView}>
-              <Stack screenOptions={{ headerShown: false, animation: 'fade' }}>
+
+  return (
+    <SafeAreaProvider>
+      <View style={{ flex: 1, backgroundColor: Theme.colors.background }}>
+        <ToastProvider>
+          <ThemeProvider value={NavTheme}>
+            <OnboardingContext.Provider value={{ isOnboardingCompleted, completeOnboarding }}>
+              <Stack
+                screenOptions={{
+                  headerShown: false,
+                  contentStyle: {
+                    backgroundColor: Theme.colors.background,
+                  },
+                  animation: 'fade_from_bottom',
+                }}
+              >
+                <Stack.Screen name="index" />
                 <Stack.Screen name="onboarding" options={{ gestureEnabled: false }} />
-                <Stack.Screen name="index" options={{ animation: 'fade' }} />
-                <Stack.Screen name="create-ticket" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
-                <Stack.Screen name="ticket/[id]" options={{ animation: 'slide_from_right' }} />
+                <Stack.Screen name="editor" options={{ presentation: 'modal' }} />
+                <Stack.Screen name="ticket/[id]" />
+                <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
               </Stack>
-
-              {/* Global Toast */}
-              {toast && (
-                <Animated.View entering={FadeInDown} exiting={FadeOutDown} style={[styles.toast, toast.type === 'error' && styles.toastError]}>
-                  <Text style={styles.toastText}>{toast.message}</Text>
-                </Animated.View>
-              )}
-            </View>
-            <StatusBar style="auto" />
+              <StatusBar style="dark" />
+            </OnboardingContext.Provider>
           </ThemeProvider>
-        </SQLiteProvider>
-      </Suspense>
-    </OnboardingContext.Provider>
-  </ToastContext.Provider>
-);
+        </ToastProvider>
+      </View>
+    </SafeAreaProvider>
+  );
 }
-
-const styles = StyleSheet.create({
-  toast: {
-    position: 'absolute',
-    bottom: Spacing.toastBottom,
-    left: Spacing.toastHorizontal,
-    right: Spacing.toastHorizontal,
-    backgroundColor: Palette.primary,
-    paddingVertical: Spacing.md,
-    paddingHorizontal: Spacing.xl,
-    borderRadius: 30,
-    alignItems: 'center',
-    justifyContent: 'center',
-    ...Shadows.premium,
-    zIndex: 10000,
-  },
-  toastError: {
-    backgroundColor: Palette.danger,
-  },
-  toastText: {
-    ...Typography.toast,
-  },
-});

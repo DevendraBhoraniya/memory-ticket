@@ -1,158 +1,193 @@
-import MemoryTicket from '@/components/MemoryTicket';
-import ConfirmModal from '@/components/ui/ConfirmModal';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import PermissionModal from '@/components/ui/PermissionModal';
-import { Palette, Shadows, Spacing, Typography } from '@/constants/theme';
-import { usePermissionGate } from '@/hooks/use-permissions';
-import { useTickets } from '@/hooks/use-tickets';
-import { Ticket } from '@/types';
-import { useTicketExport } from '@/utils/export';
-import * as Haptics from 'expo-haptics';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    Dimensions,
-    ScrollView,
-    StatusBar,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  StatusBar,
+  ActivityIndicator,
+  Modal,
+  Pressable,
+  Dimensions,
+  ScrollView,
 } from 'react-native';
+import { ScreenContainer, IconButton } from '@/components/ui';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useEffect, useState, useRef, useCallback } from 'react';
+import { Theme } from '@/theme';
+import { TicketCanvas } from '@/components/TicketCanvas';
+import { storage } from '@/utils/storage';
+import { Ticket } from '@/types';
 import Animated, {
-    FadeIn,
-    FadeInDown,
-    useAnimatedStyle,
-    useSharedValue,
-    withSpring
+  FadeInDown,
+  FadeIn,
 } from 'react-native-reanimated';
+import * as Haptics from 'expo-haptics';
+import ViewShot from 'react-native-view-shot';
+import * as MediaLibrary from 'expo-media-library';
+import * as Sharing from 'expo-sharing';
+import { useToast } from '@/components/Toast';
+import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useToast } from '../_layout';
 
 const { width } = Dimensions.get('window');
+const UNDO_TIMEOUT = 6000;
 
 export default function TicketDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
-  const insets = useSafeAreaInsets();
   const { showToast } = useToast();
-  const { deleteTicket, tickets, loading: ticketsLoading } = useTickets();
-  const { gate, closeGate, checkGalleryPermission, confirmPermission } = usePermissionGate();
-  
+  const insets = useSafeAreaInsets();
+  const viewShotRef = useRef<ViewShot>(null);
+  const undoTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
+
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loading, setLoading] = useState(true);
-  const [exporting, setExporting] = useState(false);
-  const [showDeleteModal, setShowDeleteModal] = useState(false);
-  const [isExportEngineMounted, setIsExportEngineMounted] = useState(false);
-
-  // 1. 3D Flip State & Animation
-  const rotate = useSharedValue(0);
-  const [isFlipped, setIsFlipped] = useState(false);
-
-  const frontAnimatedStyle = useAnimatedStyle(() => ({
-    transform: [{ rotateY: `${rotate.value}deg` }],
-    backfaceVisibility: 'hidden',
-  }));
-
-  const backAnimatedStyle = useAnimatedStyle(() => ({
-    transform: [{ rotateY: `${rotate.value + 180}deg` }],
-    backfaceVisibility: 'hidden',
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-  }));
-
-  const toggleFlip = () => {
-    Haptics.selectionAsync();
-    const target = isFlipped ? 0 : 180;
-    rotate.value = withSpring(target, { damping: 15, stiffness: 90 });
-    setIsFlipped(!isFlipped);
-  };
-
-  const { ticketRef, shareTicketImage, saveTicketImage } = useTicketExport();
+  const [isExporting, setIsExporting] = useState(false);
+  const [menuVisible, setMenuVisible] = useState(false);
+  const [designVariant, setDesignVariant] = useState<'postal' | 'instant'>('postal');
+  const [accentColor, setAccentColor] = useState('#D9C5B2');
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
-    if (!ticketsLoading) {
-      const found = tickets.find((t) => t.id === id);
-      if (found) {
-        setTicket(found);
-        setLoading(false);
-      } else if (tickets.length > 0) {
-        showToast('Memory not found', 'error');
-        router.back();
-      }
-    }
-  }, [tickets, ticketsLoading, id]);
+    (async () => {
+      const [tickets, variant, color] = await Promise.all([
+        storage.getTickets(),
+        storage.getDesignVariant(),
+        storage.getAccentColor(),
+      ]);
+      setDesignVariant(variant);
+      setAccentColor(color);
 
-  const confirmDelete = async () => {
-    if (id) {
-      try {
-        await deleteTicket(id);
-        setShowDeleteModal(false);
-        showToast('Memory removed');
-        router.replace('/');
-      } catch (e) {
-        showToast('Failed to remove memory', 'error');
+      const found = tickets.find(t => t.id === id);
+      if (found) {
+        if (mountedRef.current) setTicket(found);
+      } else {
+        showToast('Could not find this memory', 'error');
+        setTimeout(() => { if (mountedRef.current) router.back(); }, 600);
       }
-    }
-  };
+      setLoading(false);
+    })();
+  }, [id]);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      if (undoTimeoutRef.current) clearTimeout(undoTimeoutRef.current);
+    };
+  }, []);
 
   const handleEdit = () => {
-    Haptics.selectionAsync();
+    if (!ticket) return;
+    setMenuVisible(false);
     router.push({
-      pathname: '/create-ticket',
-      params: { ticketId: id }
+      pathname: '/editor',
+      params: {
+        editId: ticket.id,
+        initialTitle: ticket.title,
+        initialLocation: ticket.location,
+        initialDate: ticket.date,
+        initialNote: ticket.note,
+        initialCategory: ticket.category,
+        initialImageUri: ticket.photoUri,
+      },
     });
   };
 
-  const handleShare = async () => {
-    if (exporting) return;
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setExporting(true);
-    setIsExportEngineMounted(true);
-    
-    // Wait for the hidden component to layout and image to decode
-    setTimeout(async () => {
-      try {
-        await shareTicketImage();
-      } catch (error: any) {
-        showToast(error.message, 'error');
-      } finally {
-        setExporting(false);
-        setIsExportEngineMounted(false);
-      }
-    }, 500);
+  const captureImage = async (): Promise<string | null> => {
+    if (!viewShotRef.current?.capture) return null;
+    try {
+      return await viewShotRef.current.capture();
+    } catch {
+      showToast('Could not capture image', 'error');
+      return null;
+    }
   };
 
   const handleSaveToGallery = async () => {
-    if (exporting) return;
-    checkGalleryPermission(async () => {
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      setExporting(true);
-      setIsExportEngineMounted(true);
-      
-      // Wait for the hidden component to layout and image to decode
-      setTimeout(async () => {
+    setMenuVisible(false);
+    setIsExporting(true);
+    setTimeout(async () => {
+      const uri = await captureImage();
+      if (uri) {
         try {
-          await saveTicketImage();
-          showToast('Preserved to gallery');
-        } catch (error: any) {
-          showToast(error.message, 'error');
-        } finally {
-          setExporting(false);
-          setIsExportEngineMounted(false);
+          await MediaLibrary.saveToLibraryAsync(uri);
+          showToast('Saved to your gallery');
+        } catch {
+          showToast('Could not access gallery', 'warning');
         }
-      }, 500);
+      }
+      setIsExporting(false);
+    }, 400);
+  };
+
+  const handleShare = async () => {
+    setMenuVisible(false);
+    setIsExporting(true);
+    setTimeout(async () => {
+      const uri = await captureImage();
+      if (uri && (await Sharing.isAvailableAsync())) {
+        await Sharing.shareAsync(uri, {
+          mimeType: 'image/png',
+          dialogTitle: 'Share this memory',
+          UTI: 'public.png',
+        });
+      }
+      setIsExporting(false);
+    }, 400);
+  };
+
+  const handleDeleteConfirm = () => {
+    setMenuVisible(false);
+    setShowDeleteConfirm(true);
+  };
+
+  const executeDelete = async () => {
+    if (!ticket || deleting) return;
+    setDeleting(true);
+    setShowDeleteConfirm(false);
+
+    const saved = await storage.softDeleteTicket(ticket.id);
+    if (!saved) {
+      showToast('Could not delete', 'error');
+      setDeleting(false);
+      return;
+    }
+
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+    showToast({
+      message: 'Memory removed',
+      type: 'undo',
+      duration: UNDO_TIMEOUT,
+      haptic: false,
+      action: {
+        label: 'UNDO',
+        onPress: async () => {
+          if (undoTimeoutRef.current) clearTimeout(undoTimeoutRef.current);
+          const restored = await storage.undoDelete(ticket.id);
+          if (restored) {
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            setTicket(saved);
+            showToast('Memory restored');
+          }
+        },
+      },
     });
+
+    router.back();
+    setDeleting(false);
+  };
+
+  const cancelDelete = () => {
+    setShowDeleteConfirm(false);
   };
 
   if (loading) {
     return (
-      <View style={styles.centered}>
-        <ActivityIndicator size="large" color={Palette.secondary} />
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color={accentColor} />
       </View>
     );
   }
@@ -160,335 +195,316 @@ export default function TicketDetailScreen() {
   if (!ticket) return null;
 
   return (
-    <View style={styles.container}>
+    <ScreenContainer edges={['top']}>
       <StatusBar barStyle="dark-content" />
-      
-      {/* Refined Header (Matches Create Screen) */}
-      <View style={[styles.header, { paddingTop: insets.top + Spacing.md }]}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.headerBtn}>
-          <IconSymbol name="plus" size={24} color={Palette.primary} style={{ transform: [{ rotate: '45deg' }] }} />
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>MEMORABLE STUB</Text>
-        <TouchableOpacity onPress={handleEdit} style={styles.headerBtn}>
-          <Text style={styles.editAction}>EDIT</Text>
-        </TouchableOpacity>
-      </View>
 
-      <ScrollView 
-        contentContainerStyle={styles.scrollContent} 
+      {!isExporting && (
+        <Animated.View entering={FadeIn.duration(300)} style={[styles.header, { top: insets.top + 4 }]}>
+          <IconButton name="arrow-back" size={22} color={Theme.colors.ink} style={{ opacity: 0.5 }} onPress={() => router.back()} />
+          <IconButton name="ellipsis-horizontal" size={22} color={Theme.colors.ink} style={{ opacity: 0.5 }} onPress={() => setMenuVisible(true)} />
+        </Animated.View>
+      )}
+
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
-        {/* Cinematic Ticket Focus with 3D Flip */}
-        <Animated.View entering={FadeIn.duration(800)} style={styles.previewSection}>
-          <TouchableOpacity 
-            activeOpacity={1} 
-            onPress={toggleFlip}
-            style={styles.ticketWrapper}
-          >
-            <View style={styles.flipContainer}>
-              <Animated.View style={frontAnimatedStyle}>
-                <MemoryTicket ticket={ticket} variant="detail" side="front" />
-              </Animated.View>
-              <Animated.View style={backAnimatedStyle}>
-                <MemoryTicket ticket={ticket} variant="detail" side="back" />
-              </Animated.View>
-            </View>
-          </TouchableOpacity>
-          
-          <Animated.View entering={FadeIn.delay(1000)} style={styles.hintContainer}>
-             <Text style={styles.hintText}>TAP TO FLIP</Text>
+        <View style={styles.mainArea}>
+          <Animated.View entering={FadeInDown.springify().damping(30).stiffness(100)}>
+            <ViewShot
+              ref={viewShotRef}
+              options={{ format: 'png', quality: 1.0, result: 'tmpfile' }}
+              style={styles.exportArea}
+            >
+              <TicketCanvas
+                id={ticket.id}
+                imageUri={ticket.photoUri}
+                title={ticket.title}
+                location={ticket.location}
+                date={ticket.date}
+                note={ticket.note}
+                category={ticket.category}
+                design={designVariant}
+                accentColor={accentColor}
+                side="front"
+                isExporting={isExporting}
+              />
+            </ViewShot>
           </Animated.View>
-        </Animated.View>
-
-        {/* Narrative Section (Matches Create Form) */}
-        <Animated.View entering={FadeInDown.delay(200).duration(600)} style={styles.contentSection}>
-          <View style={styles.textGroup}>
-            <Text style={styles.label}>THE TITLE</Text>
-            <Text style={styles.titleText}>{ticket.title}</Text>
-          </View>
-
-          {ticket.note && (
-            <View style={styles.textGroup}>
-              <Text style={styles.label}>THE REFLECTION</Text>
-              <Text style={styles.noteText}>{ticket.note}</Text>
-            </View>
-          )}
-
-          {/* Metadata Grid (Matches Create Metadata) */}
-          <View style={styles.metadataGrid}>
-            <View style={styles.metaField}>
-              <Text style={styles.label}>LOCATION</Text>
-              <Text style={styles.metaValue}>{ticket.location || 'Somewhere'}</Text>
-            </View>
-            <View style={styles.metaField}>
-              <Text style={styles.label}>DATE</Text>
-              <Text style={styles.metaValue}>{ticket.date}</Text>
-            </View>
-          </View>
-
-          {/* Action Row (Polished & Restrained) */}
-          <View style={styles.actionRow}>
-            <ActionButton 
-              icon="square.and.arrow.up" 
-              label="SHARE" 
-              onPress={handleShare}
-              disabled={exporting}
-            />
-            <View style={styles.actionDivider} />
-            <ActionButton 
-              icon="arrow.down.to.line" 
-              label="SAVE" 
-              onPress={handleSaveToGallery}
-              disabled={exporting}
-            />
-            <View style={styles.actionDivider} />
-            <ActionButton 
-              icon="trash" 
-              label="DELETE" 
-              onPress={() => setShowDeleteModal(true)}
-              danger
-              disabled={exporting}
-            />
-          </View>
-        </Animated.View>
+        </View>
       </ScrollView>
 
-      {/* Hidden Export Engine (Lazy Mounted) */}
-      {isExportEngineMounted && (
-        <View style={styles.offscreen} pointerEvents="none">
-          <View ref={ticketRef} collapsable={false}>
-            <MemoryTicket ticket={ticket} variant="export" />
+      {isExporting && (
+        <View style={styles.exportRow}>
+          <ActivityIndicator size="small" color={accentColor} />
+          <Text style={styles.exportText}>Preparing export...</Text>
+        </View>
+      )}
+
+      {!isExporting && (
+        <Animated.View entering={FadeInDown.delay(400).springify().damping(30).stiffness(100)} style={styles.footer}>
+          <View style={styles.actions}>
+            <TouchableOpacity style={styles.actionCircle} onPress={handleShare} activeOpacity={0.7}>
+              <View style={[styles.actionIconWrap, { backgroundColor: accentColor }]}>
+                <Ionicons name="share-outline" size={18} color={Theme.colors.white} />
+              </View>
+              <Text style={styles.actionLabel}>Share</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.actionCircle} onPress={handleSaveToGallery} activeOpacity={0.7}>
+              <View style={[styles.actionIconWrap, styles.actionIconWrapSecondary]}>
+                <Ionicons name="download-outline" size={18} color={Theme.colors.ink} />
+              </View>
+              <Text style={styles.actionLabel}>Save</Text>
+            </TouchableOpacity>
           </View>
-        </View>
+        </Animated.View>
       )}
 
-      {exporting && (
-        <View style={styles.loadingOverlay}>
-          <ActivityIndicator size="large" color={Palette.background} />
-          <Text style={styles.loadingText}>PREPARING STUB</Text>
+      <Modal
+        visible={menuVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMenuVisible(false)}
+      >
+        <View style={StyleSheet.absoluteFill}>
+          <Pressable style={styles.overlay} onPress={() => setMenuVisible(false)}>
+            <Animated.View entering={FadeInDown.springify().damping(32).stiffness(90)}>
+              <View style={styles.sheet}>
+                <View style={styles.sheetHandle} />
+                <TouchableOpacity style={styles.sheetRow} onPress={handleEdit}>
+                  <Ionicons name="create-outline" size={20} color={Theme.colors.ink} style={{ opacity: 0.7 }} />
+                  <Text style={styles.sheetRowText}>Edit Memory</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetRow} onPress={handleSaveToGallery}>
+                  <Ionicons name="image-outline" size={20} color={Theme.colors.ink} style={{ opacity: 0.7 }} />
+                  <Text style={styles.sheetRowText}>Save as Image</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetRow} onPress={handleShare}>
+                  <Ionicons name="share-social-outline" size={20} color={Theme.colors.ink} style={{ opacity: 0.7 }} />
+                  <Text style={styles.sheetRowText}>Share</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.sheetRow, { borderBottomWidth: 0 }]} onPress={handleDeleteConfirm}>
+                  <Ionicons name="trash-outline" size={20} color={Theme.colors.danger} />
+                  <Text style={[styles.sheetRowText, { color: Theme.colors.danger }]}>Delete Memory</Text>
+                </TouchableOpacity>
+              </View>
+            </Animated.View>
+          </Pressable>
         </View>
-      )}
+      </Modal>
 
-      <ConfirmModal
-        visible={showDeleteModal}
-        title="Remove Memory"
-        message="This will permanently remove this stub from your collection."
-        confirmText="DELETE"
-        onConfirm={confirmDelete}
-        onCancel={() => setShowDeleteModal(false)}
-        danger
-      />
-
-      <PermissionModal
-        visible={gate.visible}
-        type={gate.kind}
-        isPermanentlyDenied={gate.isPermanentlyDenied}
-        title={gate.kind === 'photos' ? "Access Photos" : "Save to Gallery"}
-        message={gate.isPermanentlyDenied 
-          ? "Permission was previously denied. Please enable it in your device settings to continue."
-          : "We need access to your library to select and preserve your memories."
-        }
-        onConfirm={confirmPermission}
-        onCancel={closeGate}
-      />
-    </View>
+      <Modal
+        visible={showDeleteConfirm}
+        transparent
+        animationType="fade"
+        onRequestClose={cancelDelete}
+      >
+        <Pressable style={styles.confirmOverlay} onPress={cancelDelete}>
+          <Animated.View entering={FadeInDown.springify().damping(30).stiffness(90)}>
+            <View style={styles.confirmCard} onStartShouldSetResponder={() => true}>
+              <View style={[styles.confirmIconWrap, { backgroundColor: Theme.colors.danger + '18' }]}>
+                <Ionicons name="archive-outline" size={28} color={Theme.colors.danger} />
+              </View>
+              <Text style={styles.confirmTitle}>Remove this memory?</Text>
+              <Text style={styles.confirmText}>
+                It will be moved to a safe place for a few seconds in case you change your mind.
+              </Text>
+              <View style={styles.confirmActions}>
+                <TouchableOpacity style={styles.confirmCancelBtn} onPress={cancelDelete} activeOpacity={0.7}>
+                  <Text style={styles.confirmCancelText}>Keep it</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.confirmDeleteBtn} onPress={executeDelete} activeOpacity={0.7}>
+                  <Text style={styles.confirmDeleteText}>Remove</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </Animated.View>
+        </Pressable>
+      </Modal>
+    </ScreenContainer>
   );
 }
 
-interface ActionButtonProps {
-  icon: string;
-  label: string;
-  onPress: () => void;
-  danger?: boolean;
-  disabled?: boolean;
-}
-
-const ActionButton: React.FC<ActionButtonProps> = ({ icon, label, onPress, danger, disabled }) => (
-  <TouchableOpacity 
-    onPress={onPress}
-    activeOpacity={0.7}
-    disabled={disabled}
-    style={styles.actionBtn}
-  >
-    <IconSymbol 
-      name={icon as any} 
-      size={18} 
-      color={danger ? '#FF453A' : Palette.primary} 
-      style={{ opacity: disabled ? 0.3 : 1 }}
-    />
-    <Text style={[styles.actionLabel, danger && styles.dangerLabel, disabled && styles.disabledLabel]}>{label}</Text>
-  </TouchableOpacity>
-);
-
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: Palette.background,
-  },
-  centered: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: Palette.background,
-  },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: Theme.colors.background },
+
   header: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: Spacing.xl,
-    paddingBottom: Spacing.md,
-    backgroundColor: Palette.background,
+    paddingHorizontal: Theme.spacing.xl,
     zIndex: 10,
-    minHeight: 60,
-  },
-  headerTitle: {
-    ...Typography.headerTitleSmall,
-  },
-  headerBtn: {
-    width: 44,
-    height: 44,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  editAction: {
-    ...Typography.label,
-    fontSize: 12,
-    color: Palette.primary,
-    fontWeight: '800',
-    letterSpacing: 2,
   },
   scrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingTop: 60,
     paddingBottom: 100,
-    minHeight: '100%',
   },
-  previewSection: {
-    paddingHorizontal: Spacing.xl,
-    paddingTop: Spacing.md,
-    paddingBottom: Spacing.xl,
+  mainArea: {
     alignItems: 'center',
-    minHeight: 200,
-    maxHeight: 500,
+  },
+
+  exportArea: {
+    alignItems: 'center',
+  },
+
+  footer: {
+    paddingBottom: 40,
+    paddingTop: Theme.spacing.xl,
+    alignItems: 'center',
+  },
+  actions: {
+    flexDirection: 'row',
     justifyContent: 'center',
+    gap: 32,
   },
-  ticketWrapper: {
-    width: '100%',
-    maxWidth: 380,
-  },
-  flipContainer: {
-    width: '100%',
-    aspectRatio: undefined,
-    minHeight: 300,
-    ...Shadows.premium,
-  },
-  hintContainer: {
-    marginTop: Spacing.lg,
-    opacity: 0.3,
+  actionCircle: {
     alignItems: 'center',
+    gap: 8,
   },
-  hintText: {
-    ...Typography.label,
-    fontSize: 8,
-    letterSpacing: 3,
-  },
-  contentSection: {
-    paddingHorizontal: Spacing.xl,
-    paddingTop: Spacing.lg,
-    paddingBottom: Spacing.xl,
-    minHeight: 200,
-  },
-  textGroup: {
-    marginBottom: Spacing.xl,
-    minHeight: 40,
-  },
-  label: {
-    ...Typography.label,
-    fontSize: 9,
-    marginBottom: Spacing.sm,
-    color: Palette.secondary,
-    opacity: 0.6,
-  },
-  titleText: {
-    ...Typography.heroTitle,
-    marginTop: Spacing.xs,
-  },
-  noteText: {
-    ...Typography.formBody,
-    opacity: 0.9,
-    lineHeight: 26,
-  },
-  metadataGrid: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: Spacing.md,
-    marginTop: Spacing.lg,
-    paddingTop: Spacing.lg,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(229, 213, 192, 0.5)',
-    marginBottom: Spacing.xl,
-    minHeight: 80,
-  },
-  metaField: {
-    flex: 1,
-  },
-  metaValue: {
-    ...Typography.mono,
-    fontSize: 15,
-    color: Palette.primary,
-    marginTop: Spacing.xs,
-    minHeight: 36,
-    lineHeight: 24,
-  },
-  actionRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-around',
-    backgroundColor: Palette.secondaryTransparentSubtle,
+  actionIconWrap: {
+    width: 48,
+    height: 48,
     borderRadius: 24,
-    paddingVertical: Spacing.lg,
-    paddingHorizontal: Spacing.md,
-    minHeight: 60,
-  },
-  actionBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    flex: 1,
     justifyContent: 'center',
+    alignItems: 'center',
+  },
+  actionIconWrapSecondary: {
+    backgroundColor: Theme.colors.glass,
+    borderWidth: 1,
+    borderColor: Theme.colors.border,
   },
   actionLabel: {
-    ...Typography.label,
-    fontSize: 10,
-    letterSpacing: 1,
-    color: Palette.primary,
+    ...Theme.typography.caption,
+    fontSize: 11,
+    color: Theme.colors.inkMuted,
+    letterSpacing: 0.5,
   },
-  dangerLabel: {
-    color: '#FF453A',
-  },
-  disabledLabel: {
-    opacity: 0.3,
-  },
-  actionDivider: {
-    width: 1,
-    height: 20,
-    backgroundColor: 'rgba(123, 94, 67, 0.1)',
-  },
-  offscreen: {
+  exportRow: {
     position: 'absolute',
-    left: -3000,
-    width: 380,
+    bottom: 100,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
-  loadingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(26, 26, 26, 0.85)',
+  exportText: {
+    ...Theme.typography.label,
+    fontSize: 10,
+    color: Theme.colors.inkMuted,
+    letterSpacing: 1,
+  },
+
+  overlay: { flex: 1, backgroundColor: Theme.colors.overlay, justifyContent: 'flex-end' },
+  sheet: {
+    backgroundColor: Theme.colors.surface,
+    borderTopLeftRadius: Theme.borderRadius.container,
+    borderTopRightRadius: Theme.borderRadius.container,
+    borderTopWidth: 1,
+    borderTopColor: Theme.colors.border,
+    paddingHorizontal: Theme.spacing.xl,
+    paddingTop: 12,
+    paddingBottom: 48,
+  },
+  sheetHandle: {
+    width: 32,
+    height: 4,
+    borderRadius: Theme.borderRadius.pill,
+    backgroundColor: Theme.colors.border,
+    alignSelf: 'center',
+    marginBottom: 24,
+  },
+  sheetRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 18,
+    borderBottomWidth: 1,
+    borderBottomColor: Theme.colors.borderLight,
+    gap: 16,
+  },
+  sheetRowText: {
+    ...Theme.typography.body,
+    fontSize: 15,
+    color: Theme.colors.ink,
+    letterSpacing: 0.3,
+  },
+  confirmOverlay: {
+    flex: 1,
+    backgroundColor: Theme.colors.overlay,
     justifyContent: 'center',
     alignItems: 'center',
-    zIndex: 1000,
+    padding: Theme.spacing.xl,
   },
-  loadingText: {
-    ...Typography.label,
-    color: Palette.background,
-    marginTop: Spacing.lg,
-    letterSpacing: 4,
+  confirmCard: {
+    backgroundColor: Theme.colors.surface,
+    borderRadius: Theme.borderRadius.container,
+    borderWidth: 1,
+    borderColor: Theme.colors.border,
+    padding: 32,
+    width: '100%',
+    maxWidth: 340,
+    alignItems: 'center',
+    gap: 12,
+  },
+  confirmIconWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  confirmTitle: {
+    ...Theme.typography.displaySmall,
+    fontSize: 18,
+    color: Theme.colors.ink,
+    textAlign: 'center',
+  },
+  confirmText: {
+    ...Theme.typography.body,
+    fontSize: 14,
+    color: Theme.colors.inkMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    paddingHorizontal: 8,
+  },
+  confirmActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+    width: '100%',
+  },
+  confirmCancelBtn: {
+    flex: 1,
+    height: 50,
+    borderRadius: Theme.borderRadius.container,
+    borderWidth: 1,
+    borderColor: Theme.colors.border,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: Theme.colors.surface,
+  },
+  confirmCancelText: {
+    ...Theme.typography.body,
+    fontSize: 14,
+    color: Theme.colors.ink,
+  },
+  confirmDeleteBtn: {
+    flex: 1,
+    height: 50,
+    borderRadius: Theme.borderRadius.container,
+    backgroundColor: Theme.colors.danger,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  confirmDeleteText: {
+    ...Theme.typography.label,
     fontSize: 12,
+    color: Theme.colors.white,
+    letterSpacing: 1,
   },
 });
